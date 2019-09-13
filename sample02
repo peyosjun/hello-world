@@ -1,0 +1,188 @@
+-- 新規ユーザーが、その翌月以降に購入した合計金額を抽出
+
+-- 新規/既存の定義
+-- 過去の年月に一度も対象サービスの購入がなければ新規、一度でも対象サービスの購入(10円かどうか問わない)があれば既存
+
+with
+-- 集計実行日の前日から、対象サービスの各年月の購入を抽出
+-- 新規/既存の区別を buy_status、
+-- buy_status が新規：初回購入年月に一致する
+--               継続：初回購入年月に一致しない
+raw_purchase_data as
+(
+select
+      member_id
+    , id
+    , order_id
+    , date
+    , price
+    , case when date = min(date) over(partition by member_id) then '新規' else '既存' end as buy_status
+from
+    sample_book.u_order_item
+where
+    date <= CAST(DATE_ADD('day', +1, CAST('{{集計終了日}}' AS DATE)) AS VARCHAR)
+    AND shop_name = 'digital_gbook'
+    AND member_id like 'D100%'
+    AND price > 0
+)
+--sample_book.a_coupon_effect_measurementのデータをヶ月間取ってくる
+, coupon_effect as
+(
+    select
+        coupon_id
+        , order_item_id
+        , member_id
+        , shop_name
+        , item_id
+        , used_at
+    from
+        sample_book.a_coupon_effect_measurement
+    where
+        used_at >= CAST(DATE_ADD('day', +1, CAST('{{集計開始日}}' AS DATE)) AS VARCHAR)
+        and coupon_id = 7
+)
+-- 結合させるためにデータを絞る、2018年1月以降で初めて購入された年月から集計する
+-- 広告流入で購入するとcommon_affiliatetag.affiliate_entryにデータが溜まるので電書の購入id（order_id）とaffiliate_entry.purchase_idで紐付けする
+, datamart as
+(
+    select
+        raw_purchase_data.member_id
+        , first_value(raw_purchase_data.order_id) over(partition by raw_purchase_data.id) as order_id
+        , raw_purchase_data.date
+        , raw_purchase_data.price
+        , raw_purchase_data.buy_status
+        -- sample_book.a_coupon_effect_measurementのorder_item_idと電書のu_order_item.idは同じなので一致すればクーポン利用
+        , case when raw_purchase_data.id = coupon_effect.order_item_id then '利用' else '不利用' end as coupon
+    from
+        raw_purchase_data AS raw_purchase_data
+        left join
+        coupon_effect AS coupon_effect
+        on raw_purchase_data.id = coupon_effect.order_item_id
+        and raw_purchase_data.member_id = coupon_effect.member_id
+    where 
+        raw_purchase_data.date BETWEEN '{{集計開始日}}' and CAST(DATE_ADD('day', +1, CAST('{{集計終了日}}' AS DATE)) AS VARCHAR)
+)
+-- 新規ユーザーとその年月の一覧を抽出
+-- 年月がコホートの基準となる月
+, standard_yrmo_data as
+(
+    select
+      member_id
+    , substr(date, 1,7) as dt
+    , sum(price) as price
+    , buy_status
+    from
+      datamart
+    where
+      buy_status = '新規'
+      and coupon = '利用'
+      -- and coupon = '不利用'
+    group by
+      member_id
+    , substr(date, 1,7)
+    , buy_status
+)
+-- 対象期間内対象ユーザー（母数）の全ての年月を抽出
+, all_target_user_yrmo_data as
+(
+    select
+      member_id
+    , substr(date, 1,7) as standard_yrmo
+    , price
+    from
+      datamart
+    where
+      buy_status = '新規'
+)
+-- 対象期間内ユーザーの全ての年月を抽出
+, all_yrmo_data as
+(
+    select
+      member_id
+    , substr(date, 1,7) as dt
+    , sum(price) as price
+    , buy_status
+    from
+      datamart
+    group by
+      member_id
+    , substr(date, 1,7)
+    , buy_status
+)
+-- 新規ユーザーの一番最初の購入情報と2回目以降の購入情報を結合
+, buy_data as
+(
+    select
+      a1.member_id
+    , a1.dt as standard_yrmo
+    , a2.dt as continuation_yrmo
+    , a2.price
+    from
+      standard_yrmo_data as a1
+    left join
+      all_yrmo_data as a2
+      on  a1.member_id = a2.member_id
+      and a1.dt <= a2.dt
+)
+-- 各年月、UU数を計算
+, cnt_uu_data as
+(
+    select
+      standard_yrmo
+    , count(distinct member_id) as total_new
+    from
+      buy_data
+    group by
+      standard_yrmo
+)
+-- 各年月、対象全体UU数（母数）を計算
+, cnt_all_target_user_yrmo_data as
+(
+    select
+      standard_yrmo
+    , count(distinct member_id) as total_new
+    from
+      all_target_user_yrmo_data
+    group by
+      standard_yrmo
+)
+-- 年月別、経過月別に合計の売上金額を計算
+-- 購入後、翌月以降購入なしでNULLとなっているレコードを除外
+, cnt_continu_data as
+(
+select
+    standard_yrmo
+    , continuation_yrmo
+    , date_diff('month', cast(standard_yrmo || '-01' as timestamp), cast(continuation_yrmo || '-01' as timestamp)) as month_num
+    , count(distinct member_id) as cnt
+    , sum(price) as price
+from
+    buy_data
+where
+    continuation_yrmo is not null
+group by
+    date_diff('month', cast(standard_yrmo || '-01' as timestamp), cast(continuation_yrmo || '-01' as timestamp))
+    , standard_yrmo
+    , continuation_yrmo
+)
+-- (8)コホートの形にして出力
+select
+    a1.standard_yrmo || ' ' as "年月"
+    , a1.standard_yrmo || '-01' as "年月コホート用"
+    , a2.continuation_yrmo as "利用年月"
+    , a2.month_num as "継続ヶ月"
+    , a1.total_new as "新規対象者数"
+    , a2.cnt as "新規対象者継続数"
+    , a2.price as "新規売上金額"
+    , 1.0 * a2.price / a2.cnt as "新規対象ARPPU"
+from
+    cnt_uu_data as a1
+    inner join
+    cnt_continu_data as a2
+    on a1.standard_yrmo = a2.standard_yrmo
+order by
+    a1.standard_yrmo
+    , a2.continuation_yrmo
+    , a2.month_num
+
+limit 10000

@@ -1,0 +1,1073 @@
+--{{集計開始日}}{{集計終了日}}{{shop}}{{キャンペーン名}}{{オーナー名}}{{メーカー名}}{{レーベル名}}
+WITH
+--全ての決済情報を取得シリーズID、シリーズ名があとでシリーズの売上を集計するときに必要なのでもっておく。
+raw_data_purchase as (
+    select
+        u_order_item.id
+        , u_order_item.date
+        , u_order_item.member_id
+        , u_order_item.price
+        , u_order_item.normal_price
+        , u_order_item.m_item_id
+        , u_order_item.shop_name
+        , u_order_item.productset_campaign_id
+        , case when substr(u_order_item.date,1,7) = min(substr(u_order_item.date,1,7)) over(partition by member_id) then '新規' else '既存' end as buy_status
+        , 1 as quantity
+        , digital_content.series_id
+        , digital_content.content_id
+        , series.series
+    from
+        sample_book.u_order_item as u_order_item
+        --m_item_id(product_id)をキーにsample_content.digital_contentからowner_idを取得
+        inner join
+        sample_content.digital_content as digital_content
+        on u_order_item.m_item_id = digital_content.product_id
+        --series_idをキーにsample_content.seriesからseries名を取得
+        inner join
+        sample_content.series as series
+        on digital_content.series_id = series.series_id
+    where
+        u_order_item.date <= '{{集計終了日}} 23:59:59.99'
+        and u_order_item.member_id like 'D100%'
+        and u_order_item.price > 0
+),
+--期間中の0円の売上だけを集計。
+raw_data_zero_purchase as (
+    select
+        u_order_item.id
+        , u_order_item.date
+        , u_order_item.member_id
+        , u_order_item.price
+        , u_order_item.normal_price
+        , u_order_item.m_item_id
+        , u_order_item.shop_name
+        , u_order_item.productset_campaign_id
+        , '0円決済' as buy_status
+        , 1 as quantity
+        , digital_content.series_id
+        , digital_content.content_id
+        , series.series
+    from
+        sample.u_order_item as u_order_item
+        --m_item_id(product_id)をキーにsample_content.digital_contentからowner_idを取得
+        inner join
+        sample_content.digital_content as digital_content
+        on u_order_item.m_item_id = digital_content.product_id
+        --series_idをキーにsample_content.seriesからseries名を取得
+        inner join
+        sample_content.series as series
+        on digital_content.series_id = series.series_id
+    where
+        date BETWEEN cast(date_trunc('day', date_add('day', -62, cast('{{集計開始日}}' as date))) as varchar) AND '{{集計終了日}} 23:59:59.99'
+        and u_order_item.member_id like 'D100%'
+        and u_order_item.price = 0
+        and case '{{shop}}' WHEN '一般' THEN u_order_item.shop_name = 'digital_gbook'
+                            WHEN 'アダルト' THEN u_order_item.shop_name = 'digital_book'
+                            END
+),
+--キャンペーン終了日が集計期間に含まれたキャンペーンの売上を集計するため集計開始日の31日前から集計終了日を売上を集計
+--集計開始日の31日前からとするのは1ヶ月以上続くキャンペーンがないため
+--この時にbuy_statusを付与する。
+union_sales as (
+    select
+        *
+    from
+        raw_data_purchase
+    where
+        date BETWEEN cast(date_trunc('day', date_add('day', -62, cast('{{集計開始日}}' as date))) as varchar) AND '{{集計終了日}} 23:59:59.99'
+        and case '{{shop}}' WHEN '一般' THEN shop_name = 'digital_gbook'
+                            WHEN 'アダルト' THEN shop_name = 'digital_book'
+                            END
+    
+    union all
+
+    select
+        *
+    from
+        raw_data_zero_purchase
+),
+--0円以上の売上と0円だけの売上をunion allしたものにジャンルをjoinしてフロアを割り振る。
+target_sales as (
+    select distinct
+        t1.id
+        , t1.date
+        , t1.member_id
+        , t1.price
+        , t1.normal_price
+        , t1.m_item_id
+        , t1.shop_name
+        , t1.productset_campaign_id
+        , t1.buy_status
+        , t1.quantity
+        , t1.series_id
+        , t1.content_id
+        , t1.series
+        , case when genre.genre in ('アダルトコミック単行本','アダルトコミック単話','アダルトコミック誌') then 'アダルトコミック'
+            when genre.genre in ('美少女ノベル','官能小説') then '美少女ノベル・官能小説'
+            when genre.genre in ('アダルト写真集','アダルト雑誌') then 'アダルト写真集・雑誌'
+            when genre.genre in ('青年コミック','少年コミック','ソフトエッチコミック') then '男性コミック'
+            when genre.genre in ('小説・文芸','ライトノベル','官能小説','ロマンス小説','雑誌') then '文芸・ラノベ'
+            when genre.genre in ('雑学・エンタメ','学術・語学','趣味','旅行','暮らし・健康・美容','ビジネス') then 'ビジネス・実用'
+            when genre.genre in ('レディースコミック','少女コミック','ロマンスコミック') then '女性コミック'
+            when genre.genre in ('ボーイズラブコミック','ボーイズラブ小説') then 'BL'
+            when genre.genre in ('ティーンズラブコミック','ティーンズラブ小説') then 'TL'
+            when genre.genre in ('女性','男性','風景・その他') then '写真集'
+        ELSE 'その他'
+        END as floor_name
+    from
+        union_sales as t1
+        -- content_idをキーにsample_content.digital_bookからgenre_idを取得
+        inner join
+        sample_content.digital_book as digital_book
+        on t1.m_item_id = digital_book.product_id
+        -- genre_idをキーにsample_content.genreからgenre_idを取得
+        inner join
+        sample_content.genre AS genre
+        ON digital_book.genre_id = genre.genre_id
+),
+-- ▼ 値引とポイント還元とセットどれもあるキャンペーン名を抽出する。
+--nameは大型キャンペーンなどで同一キャンペーンなのにキャンペーン名が登録上複数出来てしまうことがあるにナンバリングなどを置換して同一キャンペーンとなるように集計する。
+campaign_name_multiple_all AS
+(
+    select DISTINCT
+        t1.campaign_id as dicount_campaign_id
+        , t2.campaign_id as point_campaign_id
+        , t3.id as set_campaign_id
+        , t1.name
+        , regexp_replace(regexp_replace(regexp_replace(t1.name, '還元（20th）[0-9][0-9]_[0-9]|還元（20th）[0-9][0-9]', '還元（20th）'), '還元[0-9][0-9]_[0-9]', '還元'), '還元[0-9][0-9]', '還元') as replace_name
+        , '割引&還元&セット' as type
+        , t1.begin_date
+        , substr(t1.begin_date,1,10) as substr_begin_date
+        , substr(t1.begin_date,12,11) as substr_begin_time
+        , t1.end_date
+        , substr(t1.end_date,1,10) as substr_end_date
+        , substr(t1.end_date,12,11) as substr_end_time
+        , date_diff('day', cast(substr(t1.begin_date,1,10) as timestamp), cast(substr(t1.end_date,1,10) as timestamp))+1 as days
+        , t1.shop_name
+    from
+        sample_book.a_campaign as t1
+        inner join
+        sample_book.a_point_campaign as t2
+        on t1.tag = t2.tag
+        and t1.begin_date = t2.begin_date
+        and t1.end_date = t2.end_date
+        inner join
+        sample_book.a_productset_campaign as t3
+        on t1.tag = t3.tag
+        and t1.begin_date = t3."begin"
+        and t1.end_date = t3."end"
+    where
+        t1.campaign_st = 2
+        and case '{{shop}}' WHEN '一般' THEN t1.shop_name = 'digital_gbook'
+                            WHEN 'アダルト' THEN t1.shop_name = 'digital_book'
+                            END
+        and t2.campaign_st = 2
+        and case '{{shop}}' WHEN '一般' THEN t2.shop_name = 'digital_gbook'
+                            WHEN 'アダルト' THEN t2.shop_name = 'digital_book'
+                            END
+        and t3.status = 2
+        and case '{{shop}}' WHEN '一般' THEN t3.shop_name = 'digital_gbook'
+                            WHEN 'アダルト' THEN t3.shop_name = 'digital_book'
+                            END
+        --キャンペーン終了日が集計期間に含まれるキャンペーンを抽出
+        and t1.end_date between '{{集計開始日}}' and '{{集計終了日}} 23:59:59.99'
+        and case '{{キャンペーン名}}' WHEN '全て' THEN t1.name <> 'alsdflgk'
+                            ELSE t1.name LIKE '%{{キャンペーン名}}%'
+                            END
+),
+-- ▼ 値引とポイント還元どちらもあるキャンペーン名を抽出する。
+--nameは大型キャンペーンなどで同一キャンペーンなのにキャンペーン名が登録上複数出来てしまうことがあるにナンバリングなどを置換して同一キャンペーンとなるように集計する。
+campaign_name_multiple_discount_and_point AS
+(
+    select DISTINCT
+        t1.campaign_id as dicount_campaign_id
+        , t2.campaign_id as point_campaign_id
+        , 0 as set_campaign_id
+        , t1.name
+        , regexp_replace(regexp_replace(regexp_replace(t1.name, '還元（20th）[0-9][0-9]_[0-9]|還元（20th）[0-9][0-9]', '還元（20th）'), '還元[0-9][0-9]_[0-9]', '還元'), '還元[0-9][0-9]', '還元') as replace_name
+        , '割引&還元' as type
+        , t1.begin_date
+        , substr(t1.begin_date,1,10) as substr_begin_date
+        , substr(t1.begin_date,12,11) as substr_begin_time
+        , t1.end_date
+        , substr(t1.end_date,1,10) as substr_end_date
+        , substr(t1.end_date,12,11) as substr_end_time
+        , date_diff('day', cast(substr(t1.begin_date,1,10) as timestamp), cast(substr(t1.end_date,1,10) as timestamp))+1 as days
+        , t1.shop_name
+    from
+        sample_book.a_campaign as t1
+        inner join
+        sample_book.a_point_campaign as t2
+        on t1.tag = t2.tag
+        and t1.begin_date = t2.begin_date
+        and t1.end_date = t2.end_date
+    where
+        t1.campaign_st = 2
+        and case '{{shop}}' WHEN '一般' THEN t1.shop_name = 'digital_gbook'
+                            WHEN 'アダルト' THEN t1.shop_name = 'digital_book'
+                            END
+        and t2.campaign_st = 2
+        and case '{{shop}}' WHEN '一般' THEN t2.shop_name = 'digital_gbook'
+                            WHEN 'アダルト' THEN t2.shop_name = 'digital_book'
+                            END
+        --キャンペーン終了日が集計期間に含まれるキャンペーンを抽出
+        and t1.end_date between '{{集計開始日}}' and '{{集計終了日}} 23:59:59.99'
+        and case '{{キャンペーン名}}' WHEN '全て' THEN t1.name <> 'alsdflgk'
+                                    ELSE t1.name LIKE '%{{キャンペーン名}}%'
+                                    END
+        and NOT EXISTS (
+            SELECT
+                name
+            FROM
+                campaign_name_multiple_all
+            WHERE
+                name = t1.name
+                and begin_date = t1.begin_date
+                and end_date = t1.end_date
+        )
+),
+-- ▼ 値引とセットどちらもあるキャンペーン名を抽出する。
+--nameは大型キャンペーンなどで同一キャンペーンなのにキャンペーン名が登録上複数出来てしまうことがあるにナンバリングなどを置換して同一キャンペーンとなるように集計する。
+campaign_name_multiple_discount_and_set AS
+(
+    select DISTINCT
+        t1.campaign_id as dicount_campaign_id
+        , 0 as point_campaign_id
+        , t3.id as set_campaign_id
+        , t1.name
+        , regexp_replace(regexp_replace(regexp_replace(t1.name, '還元（20th）[0-9][0-9]_[0-9]|還元（20th）[0-9][0-9]', '還元（20th）'), '還元[0-9][0-9]_[0-9]', '還元'), '還元[0-9][0-9]', '還元') as replace_name
+        , '割引&セット' as type
+        , t1.begin_date
+        , substr(t1.begin_date,1,10) as substr_begin_date
+        , substr(t1.begin_date,12,11) as substr_begin_time
+        , t1.end_date
+        , substr(t1.end_date,1,10) as substr_end_date
+        , substr(t1.end_date,12,11) as substr_end_time
+        , date_diff('day', cast(substr(t1.begin_date,1,10) as timestamp), cast(substr(t1.end_date,1,10) as timestamp))+1 as days
+        , t1.shop_name
+    from
+        sample_book.a_campaign as t1
+        inner join
+        sample_book.a_productset_campaign as t3
+        on t1.tag = t3.tag
+        and t1.begin_date = t3."begin"
+        and t1.end_date = t3."end"
+    where
+        t1.campaign_st = 2
+        and case '{{shop}}' WHEN '一般' THEN t1.shop_name = 'digital_gbook'
+                            WHEN 'アダルト' THEN t1.shop_name = 'digital_book'
+                            END
+        and t3.status = 2
+        and case '{{shop}}' WHEN '一般' THEN t3.shop_name = 'digital_gbook'
+                            WHEN 'アダルト' THEN t3.shop_name = 'digital_book'
+                            END
+        --キャンペーン終了日が集計期間に含まれるキャンペーンを抽出
+        and t1.end_date between '{{集計開始日}}' and '{{集計終了日}} 23:59:59.99'
+        and case '{{キャンペーン名}}' WHEN '全て' THEN t1.name <> 'alsdflgk'
+                                    ELSE t1.name LIKE '%{{キャンペーン名}}%'
+                                    END
+        and NOT EXISTS (
+            SELECT
+                name
+            FROM
+                campaign_name_multiple_all
+            WHERE
+                name = t1.name
+                and begin_date = t1.begin_date
+                and end_date = t1.end_date
+        )
+),
+-- ▼ 還元とセットどちらもあるキャンペーン名を抽出する。
+--nameは大型キャンペーンなどで同一キャンペーンなのにキャンペーン名が登録上複数出来てしまうことがあるにナンバリングなどを置換して同一キャンペーンとなるように集計する。
+campaign_name_multiple_point_and_set AS
+(
+    select DISTINCT
+        0 as dicount_campaign_id
+        , t2.campaign_id as point_campaign_id
+        , t3.id as set_campaign_id
+        , t2.name
+        , regexp_replace(regexp_replace(regexp_replace(t2.name, '還元（20th）[0-9][0-9]_[0-9]|還元（20th）[0-9][0-9]', '還元（20th）'), '還元[0-9][0-9]_[0-9]', '還元'), '還元[0-9][0-9]', '還元') as replace_name
+        , '還元&セット' as type
+        , t2.begin_date
+        , substr(t2.begin_date,1,10) as substr_begin_date
+        , substr(t2.begin_date,12,11) as substr_begin_time
+        , t2.end_date
+        , substr(t2.end_date,1,10) as substr_end_date
+        , substr(t2.end_date,12,11) as substr_end_time
+        , date_diff('day', cast(substr(t2.begin_date,1,10) as timestamp), cast(substr(t2.end_date,1,10) as timestamp))+1 as days
+        , t2.shop_name
+    from
+        sample_book.a_point_campaign as t2
+        inner join
+        sample_book.a_productset_campaign as t3
+        on t2.tag = t3.tag
+        and t2.begin_date = t3."begin"
+        and t2.end_date = t3."end"
+    where
+        t2.campaign_st = 2
+        and case '{{shop}}' WHEN '一般' THEN t2.shop_name = 'digital_gbook'
+                            WHEN 'アダルト' THEN t2.shop_name = 'digital_book'
+                            END
+        and t3.status = 2
+        and case '{{shop}}' WHEN '一般' THEN t3.shop_name = 'digital_gbook'
+                            WHEN 'アダルト' THEN t3.shop_name = 'digital_book'
+                            END
+        --キャンペーン終了日が集計期間に含まれるキャンペーンを抽出
+        and t2.end_date between '{{集計開始日}}' and '{{集計終了日}} 23:59:59.99'
+        and case '{{キャンペーン名}}' WHEN '全て' THEN t2.name <> 'alsdflgk'
+                                    ELSE t2.name LIKE '%{{キャンペーン名}}%'
+                                    END
+        and NOT EXISTS (
+            SELECT
+                name
+            FROM
+                campaign_name_multiple_all
+            WHERE
+                name = t2.name
+                and begin_date = t2.begin_date
+                and end_date = t2.end_date
+        )
+),
+--複数タイプのキャンペーンをunion allして単一キャンペーンを抽出するときに使う。
+campaign_name_multiple AS
+(
+    select
+        *
+    from
+        campaign_name_multiple_all
+
+    union all
+
+    select
+        *
+    from
+        campaign_name_multiple_discount_and_point
+    
+    union all
+
+    select
+        *
+    from
+        campaign_name_multiple_discount_and_set
+
+    union all
+
+    select
+        *
+    from
+        campaign_name_multiple_point_and_set
+
+),
+-- ▼ 値引キャンペーンからcampaign_both_nameを除外して抽出する。
+--nameは大型キャンペーンなどで同一キャンペーンなのにキャンペーン名が登録上複数出来てしまうことがあるにナンバリングなどを置換して同一キャンペーンとなるように集計する。
+campaign_name_discount AS
+(
+    select DISTINCT
+        campaign_id as dicount_campaign_id
+        , 0 as point_campaign_id
+        , 0 as set_campaign_id
+        , name
+        , regexp_replace(regexp_replace(regexp_replace(name, '還元（20th）[0-9][0-9]_[0-9]|還元（20th）[0-9][0-9]', '還元（20th）'), '還元[0-9][0-9]_[0-9]', '還元'), '還元[0-9][0-9]', '還元') as replace_name
+        , '割引' as type
+        , begin_date
+        , substr(begin_date,1,10) as substr_begin_date
+        , substr(begin_date,12,11) as substr_begin_time
+        , end_date
+        , substr(end_date,1,10) as substr_end_date
+        , substr(end_date,12,11) as substr_end_time
+        , date_diff('day', cast(substr(begin_date,1,10) as timestamp), cast(substr(end_date,1,10) as timestamp))+1 as days
+        , shop_name
+    from
+        sample_book.a_campaign as t1
+    where
+        campaign_st = 2
+        and case '{{shop}}' WHEN '一般' THEN shop_name = 'digital_gbook'
+                            WHEN 'アダルト' THEN shop_name = 'digital_book'
+                            END
+        --キャンペーン終了日が集計期間に含まれるキャンペーンを抽出
+        and end_date between '{{集計開始日}}' and '{{集計終了日}} 23:59:59.99'
+        and case '{{キャンペーン名}}' WHEN '全て' THEN name <> 'alsdflgk'
+                                    ELSE name LIKE '%{{キャンペーン名}}%'
+                                    END
+        and NOT EXISTS (
+            SELECT
+                name
+            FROM
+                campaign_name_multiple
+            WHERE
+                name = t1.name
+                and begin_date = t1.begin_date
+                and end_date = t1.end_date
+        )
+),
+-- ▼ 値引キャンペーンからcampaign_both_nameを除外して抽出する。
+--nameは大型キャンペーンなどで同一キャンペーンなのにキャンペーン名が登録上複数出来てしまうことがあるにナンバリングなどを置換して同一キャンペーンとなるように集計する。
+campaign_name_point AS
+(
+    select DISTINCT
+        0 as dicount_campaign_id
+        , campaign_id as point_campaign_id
+        , 0 as set_campaign_id
+        , name
+        , regexp_replace(regexp_replace(regexp_replace(name, '還元（20th）[0-9][0-9]_[0-9]|還元（20th）[0-9][0-9]', '還元（20th）'), '還元[0-9][0-9]_[0-9]', '還元'), '還元[0-9][0-9]', '還元') as replace_name
+        , '還元' as type
+        , begin_date
+        , substr(begin_date,1,10) as substr_begin_date
+        , substr(begin_date,12,11) as substr_begin_time
+        , end_date
+        , substr(end_date,1,10) as substr_end_date
+        , substr(end_date,12,11) as substr_end_time
+        , date_diff('day', cast(substr(begin_date,1,10) as timestamp), cast(substr(end_date,1,10) as timestamp))+1 as days
+        , shop_name
+    from
+        sample_book.a_point_campaign t1
+    where
+        campaign_st = 2
+        and case '{{shop}}' WHEN '一般' THEN shop_name = 'digital_gbook'
+                            WHEN 'アダルト' THEN shop_name = 'digital_book'
+                            END
+        --キャンペーン終了日が集計期間に含まれるキャンペーンを抽出
+        and end_date between '{{集計開始日}}' and '{{集計終了日}} 23:59:59.99'
+        and case '{{キャンペーン名}}' WHEN '全て' THEN name <> 'alsdflgk'
+                                    ELSE name LIKE '%{{キャンペーン名}}%'
+                                    END
+        and NOT EXISTS (
+            SELECT
+                name
+            FROM
+                campaign_name_multiple
+            WHERE
+                name = t1.name
+                and begin_date = t1.begin_date
+                and end_date = t1.end_date
+        )
+),
+-- ▼ 値引キャンペーンからcampaign_both_nameを除外して抽出する。
+--nameは大型キャンペーンなどで同一キャンペーンなのにキャンペーン名が登録上複数出来てしまうことがあるにナンバリングなどを置換して同一キャンペーンとなるように集計する。
+campaign_name_set AS
+(
+    select DISTINCT
+        0 as dicount_campaign_id
+        , 0 as point_campaign_id
+        , id as set_campaign_id
+        , name
+        , regexp_replace(regexp_replace(regexp_replace(name, '還元（20th）[0-9][0-9]_[0-9]|還元（20th）[0-9][0-9]', '還元（20th）'), '還元[0-9][0-9]_[0-9]', '還元'), '還元[0-9][0-9]', '還元') as replace_name
+        , 'セット' as type
+        , "begin" as begin_date
+        , substr("begin",1,10) as substr_begin_date
+        , substr("begin",12,11) as substr_begin_time
+        , "end" as end_date
+        , substr("end",1,10) as substr_end_date
+        , substr("end",12,11) as substr_end_time
+        , date_diff('day', cast(substr("begin",1,10) as timestamp), cast(substr("end",1,10) as timestamp))+1 as days
+        , shop_name
+    from
+        sample_book.a_productset_campaign t1
+    where
+        "status" = 2
+        and deleted_at is null
+        and case '{{shop}}' WHEN '一般' THEN shop_name = 'digital_gbook'
+                            WHEN 'アダルト' THEN shop_name = 'digital_book'
+                            END
+        --キャンペーン終了日が集計期間に含まれるキャンペーンを抽出
+        and "end" between '{{集計開始日}}' and '{{集計終了日}} 23:59:59.99'
+        and case '{{キャンペーン名}}' WHEN '全て' THEN name <> 'alsdflgk'
+                                    ELSE name LIKE '%{{キャンペーン名}}%'
+                                    END
+        and NOT EXISTS (
+            SELECT
+                name
+            FROM
+                campaign_name_multiple
+            WHERE
+                name = t1.name
+                and begin_date = t1."begin"
+                and end_date = t1."end"
+        )
+),
+--↓↓↓各キャンペーンのリストを用意↓↓↓
+---------------------------------------------------------------
+
+--セットキャンペーン↓↓↓
+---------------------------------------------------------------
+--セットキャンペーンから複数タイプキャンぺーンをのぞいてm_item_id（product_id）を結合
+raw_data_campaign_item_set_regular as
+(
+    select distinct
+        t1.name
+        , t1.replace_name
+        , t1.type
+        , t1.begin_date
+        , t1.substr_begin_date
+        , t1.substr_begin_time
+        , t1.end_date
+        , t1.substr_end_date
+        , t1.substr_end_time
+        , t1.days
+        , t1.shop_name
+        , t3.product_id as content_id
+        , t3.item_id as m_item_id
+    from
+        campaign_name_set as t1
+        inner join
+        sample_book.a_productset_campaign_set as t2
+        on t1.set_campaign_id = t2.campaign_id
+        inner join
+        sample_book.a_productset_campaign_item as t3
+        on  t2.id = t3.set_id
+),
+--セットキャンペーンから複数タイプキャンぺーンをのぞいてm_item_id（product_id）を結合
+raw_data_campaign_item_set_related as
+(
+    select distinct
+        t1.name
+        , t1.replace_name
+        , t1.type
+        , t1.begin_date
+        , t1.substr_begin_date
+        , t1.substr_begin_time
+        , t1.end_date
+        , t1.substr_end_date
+        , t1.substr_end_time
+        , t1.days
+        , t1.shop_name
+        , t2.m_product_id as content_id
+        , t2.m_item_id
+    from
+        campaign_name_set as t1
+        inner join
+        sample_book.a_productset_campaign_related as t2
+        on t1.set_campaign_id = t2.a_productset_campaign_id
+),
+--キャンペーン対象と関連商品をunion all
+raw_data_campaign_item as
+(
+    select
+        *
+    from
+        raw_data_campaign_item_set_regular
+
+    union all
+
+    select
+        *
+    from
+        raw_data_campaign_item_set_related
+
+),
+--キャンペーン対象の無料作品のcontent_idを取得
+raw_limited_free_book as
+(
+    select distinct
+        t2.content_id
+        , t2.relation_content_id
+    from
+        raw_data_campaign_item as t1
+        inner join
+        sample_content.relation_book t2
+        on t1.content_id = t2.relation_content_id
+    where
+        t2.delete_flag = '0'
+),
+--キャンペーン対象の無料作品のavailable_beginとendを取得
+raw_limited_free_book_information as
+(
+    select distinct
+        t1.content_id
+        , t1.relation_content_id
+        , case when shop_digital_gbook.available_begin is not null then shop_digital_gbook.available_begin else shop_digital_book.available_begin end available_begin
+        , case when shop_digital_gbook."end" is not null then shop_digital_gbook."end" else shop_digital_book."end" end available_end
+    from
+        raw_limited_free_book as t1
+        --content_idが一般であればshop_digital_gbookからavailable_beginとendを取得
+        left join
+        sample_content.shop_digital_gbook as shop_digital_gbook
+        on t1.content_id = shop_digital_gbook.content_id
+        --content_idがアダルトであればshop_digital_gbookからavailable_beginとendを取得
+        left join
+        sample_content.shop_digital_book as shop_digital_book
+        on t1.content_id = shop_digital_book.content_id
+),
+--キャンペーンにm_item_idをキーにsample_content.relation_bookで紐づけられるコンテンツを抽出
+raw_data_campaign_limited_free_item as
+(
+    select distinct
+        t1.name
+        , t1.replace_name
+        , t1.type
+        , t1.begin_date
+        , t1.substr_begin_date
+        , t1.substr_begin_time
+        , t1.end_date
+        , t1.substr_end_date
+        , t1.substr_end_time
+        , t1.days
+        , t1.shop_name
+        , digital_content.product_id as m_item_id
+        , t2.content_id
+        , t2.relation_content_id
+    from
+        raw_limited_free_book_information as t2
+        inner join
+        raw_data_campaign_item as t1
+        on t2.relation_content_id = t1.content_id
+        and t1.substr_begin_date <= substr(t2.available_begin,1,10)
+        and t1.substr_end_date >= substr(t2.available_end,1,10)
+        left join
+        sample_content.digital_content as digital_content
+        on t2.content_id = digital_content.content_id
+),
+--キャンペーン0円商品にジャンル、オーナー、メーカー、relationのシリーズなどjoin
+raw_data_campaign_limited_free_item_datamart as
+(
+    select
+        t1.name
+        , t1.replace_name
+        , t1.type
+        , t1.begin_date
+        , t1.substr_begin_date
+        , t1.substr_begin_time
+        , t1.end_date
+        , t1.substr_end_date
+        , t1.substr_end_time
+        , t1.days
+        , t1.shop_name
+        , t1.m_item_id
+        , t1.content_id
+        , digital_content.title
+        , digital_content.owner_id
+        , digital_content.series_id
+        , series.series
+    from
+        raw_data_campaign_limited_free_item as t1
+        left join
+        sample_content.digital_content as digital_content
+        on t1.content_id = digital_content.content_id
+        --series_idをキーにsample_content.seriesからseries名を取得
+        left join
+        sample_content.series as series
+        on digital_content.series_id = series.series_id
+),
+--キャンペーン商品にジャンル、オーナー、メーカーなどjoin
+raw_data_campaign_nolimited_item_datamart_default as
+(
+    select
+        t1.name
+        , t1.replace_name
+        , t1.type
+        , t1.begin_date
+        , t1.substr_begin_date
+        , t1.substr_begin_time
+        , t1.end_date
+        , t1.substr_end_date
+        , t1.substr_end_time
+        , t1.days
+        , t1.shop_name
+        , t1.m_item_id
+        , digital_content.content_id
+        , digital_content.title
+        , digital_content.owner_id
+        , digital_content.series_id
+        , series.series
+    from
+        raw_data_campaign_item as t1
+        left join
+        sample_content.digital_content as digital_content
+        on t1.content_id = digital_content.content_id
+        --series_idをキーにsample_content.seriesからseries名を取得
+        left join
+        sample_content.series as series
+        on digital_content.series_id = series.series_id
+),
+--キャンペーン商品にジャンル、オーナー、メーカーなどjoin
+raw_data_campaign_nolimited_item_datamart as
+(
+    select
+        t1.name
+        , t1.replace_name
+        , t1.type
+        , t1.begin_date
+        , t1.substr_begin_date
+        , t1.substr_begin_time
+        , t1.end_date
+        , t1.substr_end_date
+        , t1.substr_end_time
+        , t1.days
+        , t1.shop_name
+        , t2.product_id as m_item_id
+        , t2.content_id
+        , t2.title
+        , t1.owner_id
+        , t1.series_id
+        , t1.series
+    from
+        sample_content.digital_content as t2
+        inner join
+        raw_data_campaign_nolimited_item_datamart_default as t1
+        on t2.series_id = t1.series_id
+    where
+        not exists (
+                SELECT
+                    *
+                FROM
+                    raw_data_campaign_limited_free_item
+                WHERE
+                    content_id = t2.content_id
+                    AND begin_date = t1.begin_date
+                    AND end_date = t1.end_date
+            )
+        and t2.content_type = 'book'
+),
+--キャンペーン商品と期間限定0円商品をunion all
+raw_data_campaign_item_union as
+(
+    select
+        *
+    from
+        raw_data_campaign_nolimited_item_datamart
+
+    union all
+
+    select
+        *
+    from
+        raw_data_campaign_limited_free_item_datamart
+),
+--キャンペーン商品と期間限定0円商品一覧
+raw_data_campaign_item_datamart as
+(
+    select distinct
+        t1.name
+        , t1.replace_name
+        , t1.type
+        , t1.begin_date
+        , t1.substr_begin_date
+        , t1.substr_begin_time
+        , t1.end_date
+        , t1.substr_end_date
+        , t1.substr_end_time
+        , t1.days
+        , t1.shop_name
+        , t1.m_item_id
+        , t1.content_id
+        , t1.title
+        , t1.owner_id
+        , t1.series_id
+        , t1.series
+        , maker_ref.maker_id
+        , maker.maker
+        , owner.owner
+        , label.label
+        , digital_book.type as book_type
+        , case when shop_digital_gbook.number is not null then shop_digital_gbook.number else shop_digital_book.number end as number
+        , genre.genre
+        , case when genre.genre in ('アダルトコミック単行本','アダルトコミック単話','アダルトコミック誌') then 'アダルトコミック'
+            when genre.genre in ('美少女ノベル','官能小説') then '美少女ノベル・官能小説'
+            when genre.genre in ('アダルト写真集','アダルト雑誌') then 'アダルト写真集・雑誌'
+            when genre.genre in ('青年コミック','少年コミック','ソフトエッチコミック') then '男性コミック'
+            when genre.genre in ('小説・文芸','ライトノベル','官能小説','ロマンス小説','雑誌') then '文芸・ラノベ'
+            when genre.genre in ('雑学・エンタメ','学術・語学','趣味','旅行','暮らし・健康・美容','ビジネス') then 'ビジネス・実用'
+            when genre.genre in ('レディースコミック','少女コミック','ロマンスコミック') then '女性コミック'
+            when genre.genre in ('ボーイズラブコミック','ボーイズラブ小説') then 'BL'
+            when genre.genre in ('ティーンズラブコミック','ティーンズラブ小説') then 'TL'
+            when genre.genre in ('女性','男性','風景・その他') then '写真集'
+        ELSE 'その他'
+        END as floor_name
+        , array_join(array_sort(array_agg(DISTINCT author.author)), '／') AS author
+        --actor.actorとactress.actressが異なる場合のみactress.actressも表示
+        , case when   array_join(array_sort(array_agg(DISTINCT actor.actor)), '／') 
+                = array_join(array_sort(array_agg(DISTINCT actress.actress)), '／') 
+            then array_join(array_sort(array_agg(DISTINCT actor.actor)), '／')
+            else    array_join(array_sort(array_agg(DISTINCT actor.actor)), '／')
+                || array_join(array_sort(array_agg(DISTINCT actress.actress)), '／') 
+        end AS actor_actress
+    from
+        raw_data_campaign_item_union as t1
+        --m_item_id(product_id)をキーにsample_content.maker_refからmaker_idを取得
+        left join
+        sample_content.maker_ref as maker_ref
+        on t1.m_item_id = maker_ref.product_id
+        --maker_idをキーにsample_content.makerからmakerを取得
+        left join
+        sample_content.maker as maker
+        on maker_ref.maker_id = maker.maker_id
+        --owner_idをキーにsample_content.ownerからownerを取得
+        left join
+        sample_content.owner as owner
+        on t1.owner_id = owner.owner_id
+        -- content_idをキーにsample_content.digital_bookからgenre_idを取得
+        left join
+        sample_content.digital_book as digital_book
+        on t1.m_item_id = digital_book.product_id
+        -- genre_idをキーにsample_content.genreからgenre_idを取得
+        left join
+        sample_content.genre AS genre
+        ON digital_book.genre_id = genre.genre_id
+        --label_idをキーにsample_content.labelからlabelを取得
+        LEFT JOIN
+        sample_content.label AS label
+        ON digital_book.label_id = label.label_id
+        --content_idをキーにauthor_idをsample_content.author_refから取得
+        LEFT JOIN
+        sample_content.author_ref AS author_ref
+        ON t1.content_id = author_ref.content_id
+        --author_idをキーにauthorをsample_content.authorから取得
+        LEFT JOIN
+        sample_content.author AS author
+        ON author_ref.author_id = author.author_id  
+        --content_idをキーにsample_content.actor_refからactor_idを取得
+        LEFT JOIN
+        sample_content.actor_ref AS actor_ref
+        ON t1.content_id = actor_ref.content_id
+        --actor_idをキーにsample_content.actorからactorを取得
+        LEFT JOIN
+        sample_content.actor AS actor
+        ON actor_ref.actor_id = actor.actor_id
+        --content_idをキーにsample_content.actress_refからactress_idを取得
+        LEFT JOIN
+        sample_content.actress_ref AS actress_ref
+        ON t1.content_id = actress_ref.content_id
+        --actress_idをキーにsample_content.actressからactressを取得
+        LEFT JOIN
+        sample_content.actress AS actress
+        ON actress_ref.actress_id = actress.actress_id
+        --content_idが一般であればshop_digital_gbookからavailable_beginとendを取得
+        LEFT JOIN
+        sample_content.shop_digital_gbook as shop_digital_gbook
+        on t1.m_item_id = shop_digital_gbook.product_id
+        --content_idがアダルトであればshop_digital_gbookからavailable_beginとendを取得
+        LEFT JOIN
+        sample_content.shop_digital_book as shop_digital_book
+        on t1.m_item_id = shop_digital_book.product_id
+    where
+        case '{{オーナー名}}' WHEN '全て' THEN owner.owner <> 'alsdflgk'
+                                                    ELSE owner.owner like '%{{オーナー名}}%'
+                                                    END
+        and
+        case '{{メーカー名}}' WHEN '全て' THEN maker.maker <> 'alsdflgk'
+                                                    ELSE maker.maker like '%{{メーカー名}}%'
+                                                    END
+        and
+        case '{{レーベル名}}' WHEN '全て' THEN label.label <> 'alsdflgk'
+                                                    ELSE label.label like '%{{レーベル名}}%'
+                                                    END
+    group by
+        t1.name
+        , t1.replace_name
+        , t1.type
+        , t1.begin_date
+        , t1.substr_begin_date
+        , t1.substr_begin_time
+        , t1.end_date
+        , t1.substr_end_date
+        , t1.substr_end_time
+        , t1.days
+        , t1.shop_name
+        , t1.m_item_id
+        , t1.content_id
+        , t1.title
+        , t1.owner_id
+        , t1.series_id
+        , t1.series
+        , maker_ref.maker_id
+        , maker.maker
+        , owner.owner
+        , label.label
+        , digital_book.type
+        , case when shop_digital_gbook.number is not null then shop_digital_gbook.number else shop_digital_book.number end
+        , genre.genre
+        , case when genre.genre in ('アダルトコミック単行本','アダルトコミック単話','アダルトコミック誌') then 'アダルトコミック'
+            when genre.genre in ('美少女ノベル','官能小説') then '美少女ノベル・官能小説'
+            when genre.genre in ('アダルト写真集','アダルト雑誌') then 'アダルト写真集・雑誌'
+            when genre.genre in ('青年コミック','少年コミック','ソフトエッチコミック') then '男性コミック'
+            when genre.genre in ('小説・文芸','ライトノベル','官能小説','ロマンス小説','雑誌') then '文芸・ラノベ'
+            when genre.genre in ('雑学・エンタメ','学術・語学','趣味','旅行','暮らし・健康・美容','ビジネス') then 'ビジネス・実用'
+            when genre.genre in ('レディースコミック','少女コミック','ロマンスコミック') then '女性コミック'
+            when genre.genre in ('ボーイズラブコミック','ボーイズラブ小説') then 'BL'
+            when genre.genre in ('ティーンズラブコミック','ティーンズラブ小説') then 'TL'
+            when genre.genre in ('女性','男性','風景・その他') then '写真集'
+        ELSE 'その他'
+        END
+),
+--キャンペーンの対象作品数、シリーズ数、オーナー数、メーカー数などを取得
+campaign_shipping as (
+    SELECT
+        name
+        , floor_name
+        , begin_date
+        , end_date
+        , content_id
+        , count(distinct content_id) as cnt_shipping
+        , count(distinct series_id) as cnt_series
+        , count(distinct owner) as cnt_o_id
+        , count(distinct maker) as cnt_m_id
+        , array_join(array_sort(array_agg(DISTINCT owner)), '／') as links_owner
+        , array_join(array_sort(array_agg(DISTINCT maker)), '／') as links_maker
+        , array_join(array_sort(array_agg(DISTINCT label)), '／') as links_label
+    FROM
+        raw_data_campaign_item_datamart
+    group by
+        name
+        , floor_name
+        , begin_date
+        , end_date
+        , content_id
+),
+--キャンペーンリストと対象作品数、シリーズ数、オーナー数、メーカー数などを取得をjoin
+campaign_information as (
+    SELECT distinct
+        t1.name
+        , t1.type
+        , t1.begin_date
+        , t1.substr_begin_date
+        , t1.substr_begin_time
+        , t1.end_date
+        , t1.substr_end_date
+        , t1.substr_end_time
+        , t1.days
+        , t1.m_item_id
+        , t1.content_id
+        , t1.title
+        , t1.shop_name
+        , t1.owner_id
+        , t1.series_id
+        , t1.maker_id
+        , t1.maker
+        , t1.owner
+        , t1.series
+        , t1.floor_name
+        , t1.label
+        , t1.book_type
+        , t1.number
+        , t1.genre
+        , t2.cnt_o_id
+        , t2.links_owner
+        , t2.cnt_m_id
+        , t2.links_maker
+        , t2.links_label
+        , t2.cnt_shipping
+        , t2.cnt_series
+        , first_value(t1.author) over(partition by t1.series_id order by t1.number desc) as author
+        , first_value(t1.actor_actress) over(partition by t1.series_id order by t1.number desc) as actor_actress
+        , first_value(t1.number) over(partition by t1.series_id order by t1.number desc) as max_number
+    FROM
+        campaign_shipping as t2
+        left join
+        raw_data_campaign_item_datamart as t1
+        on t1.name = t2.name
+        and t1.begin_date = t2.begin_date
+        and t1.end_date = t2.end_date
+        and t1.floor_name = t2.floor_name
+        and t1.content_id = t2.content_id
+    group by
+        t1.name
+        , t1.type
+        , t1.begin_date
+        , t1.substr_begin_date
+        , t1.substr_begin_time
+        , t1.end_date
+        , t1.substr_end_date
+        , t1.substr_end_time
+        , t1.days
+        , t1.m_item_id
+        , t1.content_id
+        , t1.title
+        , t1.shop_name
+        , t1.owner_id
+        , t1.series_id
+        , t1.maker_id
+        , t1.maker
+        , t1.owner
+        , t1.series
+        , t1.floor_name
+        , t1.label
+        , t1.book_type
+        , t1.number
+        , t1.genre
+        , t2.cnt_o_id
+        , t2.links_owner
+        , t2.cnt_m_id
+        , t2.links_maker
+        , t2.links_label
+        , t2.cnt_shipping
+        , t2.cnt_series
+        , t1.author
+        , t1.actor_actress
+),
+--キャンペーン対象ではないシリーズ売上を抽出
+campaign_purchase AS (
+    SELECT DISTINCT
+        t1.name as "キャンペーン名"
+        , t1.links_owner as "オーナー名"
+        , t1.links_maker as "メーカー名"
+        , t1.links_label as "レーベル名"
+        , t1.floor_name as "フロア"
+        , t1.type as "施策内容"
+        , t1.begin_date as "開始日"
+        , t1.end_date as "終了日"
+        , t1.days as "日数"
+        , t1.series_id as "Sid"
+        , t1.series as "シリーズ名"
+        , t1.content_id as "Cid"
+        , t1.title as "タイトル"
+        , t1.author as "作家名"
+        , t1.actor_actress as "出演者"
+        , t1.number as "巻数"
+        , t1.max_number as "対象の巻数"
+        , t1.book_type as "タイプ"
+        , t1.genre as "ジャンル"
+        , count(distinct t2.content_id) as "売上があったCid数"
+        , count(distinct case when t2.price = 0 then t2.content_id end) as "0円決済Cid数"
+        , count(distinct t2.productset_campaign_id) as "売上があったセット数"
+        , sum(case when t2.price > 0 and t2.date >= t1.begin_date and t2.date <= t1.end_date then t2.quantity else 0 end) as "CP中有料DL数"
+        , sum(case when t2.price > 0 and t2.date >= t1.begin_date and t2.date <= t1.end_date and t2.productset_campaign_id IS NOT NULL then t2.quantity else 0 end) as "CP中セットDL数"
+        , sum(case when t2.price = 0 and t2.date >= t1.begin_date and t2.date <= t1.end_date then t2.quantity else 0 end) as "CP中0円決済DL数"
+        , sum(case when t2.date >= t1.begin_date and t2.date <= t1.end_date then t2.price else 0 end) as "CP中売上"
+        , sum(case when t2.price > 0 and t2.date >= (cast(date_trunc('day', date_add('day', (t1.days * -1), cast(t1.substr_begin_date as date))) as varchar)||' '||t1.substr_begin_time) and t2.date <= (cast(date_trunc('day', date_add('day', (t1.days * -1), cast(t1.substr_end_date as date))) as varchar)||' '||t1.substr_end_time) then t2.quantity else 0 end) as "CP前有料DL数"
+        , sum(case when t2.price = 0 and t2.date >= (cast(date_trunc('day', date_add('day', (t1.days * -1), cast(t1.substr_begin_date as date))) as varchar)||' '||t1.substr_begin_time) and t2.date <= (cast(date_trunc('day', date_add('day', (t1.days * -1), cast(t1.substr_end_date as date))) as varchar)||' '||t1.substr_end_time) then t2.quantity else 0 end) as "CP前0円決済DL数"
+        , sum(case when t2.date >= (cast(date_trunc('day', date_add('day', (t1.days * -1), cast(t1.substr_begin_date as date))) as varchar)||' '||t1.substr_begin_time) and t2.date <= (cast(date_trunc('day', date_add('day', (t1.days * -1), cast(t1.substr_end_date as date))) as varchar)||' '||t1.substr_end_time) then t2.price else 0 end) as "CP前売上"        
+        , 100 * (CAST(nullif(sum(case when t2.date >= t1.begin_date and t2.date <= t1.end_date then t2.price else 0 end), 0) as double) / nullif(sum(case when t2.date >= cast(date_trunc('day', date_add('day', (t1.days * -1), cast(t1.substr_begin_date as date))) as varchar)||' '||t1.substr_begin_time and t2.date <= cast(date_trunc('day', date_add('day', (t1.days * -1), cast(t1.substr_end_date as date))) as varchar)||' '||t1.substr_end_time then t2.price else 0 end), 0)) as "CP前中売上比(%)"       
+        , nullif(sum(case when t2.date >= t1.begin_date and t2.date <= t1.end_date then t2.price else 0 end), 0) / t1.days as "CP中平均売上(日)"
+        , count(distinct case when t2.price > 0 and t2.date >= t1.begin_date and t2.date <= t1.end_date then t2.member_id end) as "CP中購入UU（有料のみ）"
+        , count(distinct case when t2.buy_status = '新規' and t2.date >= t1.begin_date and t2.date <= t1.end_date then t2.member_id end) as "CP中新規UU（有料のみ）"
+        , nullif(sum(case when t2.date >= t1.begin_date and t2.date <= t1.end_date then t2.price else 0 end), 0) / nullif(count(distinct case when t2.price > 0 and t2.date >= t1.begin_date and t2.date <= t1.end_date then t2.member_id end), 0) as "CP中平均売上(購入UU)"
+        , CASE WHEN t1.shop_name = 'digital_book' then 'アダルト' WHEN t1.shop_name = 'digital_gbook' then '一般' END as "ショップ名"
+    FROM
+        campaign_information as t1
+        left join
+        target_sales as t2
+        on
+        t1.m_item_id = t2.m_item_id
+        AND cast(date_trunc('day', date_add('day', (t1.days * -1), cast(t1.substr_begin_date as date))) as varchar)||' '||t1.substr_begin_time <= t2.date
+        AND end_date >= t2.date
+        AND t1.floor_name = t2.floor_name
+    group by
+        t1.name
+        , t1.links_owner
+        , t1.links_maker
+        , t1.links_label
+        , t1.floor_name
+        , t1.type
+        , t1.begin_date
+        , t1.end_date
+        , t1.days
+        , t1.series_id
+        , t1.series
+        , t1.content_id
+        , t1.title
+        , t1.author
+        , t1.actor_actress
+        , t1.number
+        , t1.max_number
+        , t1.book_type
+        , t1.genre
+        , CASE WHEN t1.shop_name = 'digital_book' then 'アダルト' WHEN t1.shop_name = 'digital_gbook' then '一般' END
+    order by
+        sum(case when t2.date >= t1.begin_date and t2.date <= t1.end_date then t2.price else 0 end) desc
+        , count(distinct case when t2.price = 0 then t2.content_id end) asc
+)
+SELECT
+    *
+FROM
+    campaign_purchase as t1
+LIMIT 100000
